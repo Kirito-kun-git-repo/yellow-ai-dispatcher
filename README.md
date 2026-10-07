@@ -67,6 +67,10 @@ npx newman run postman/dispatcher.postman_collection.json \
 Folder 2 needs the workers running; folders 0, 1, 3 and 4 do not. Folder 3 is cleanest with
 `PROVIDER_ERROR_RATE=0 PROVIDER_TIMEOUT_RATE=0`.
 
+The two Claude Code sessions this was built in are in
+[`docs/transcripts/`](docs/transcripts/) — the design argument in one window, the build in
+the other, including the points where they disagreed.
+
 There is also a walkthrough of the call order and what each endpoint does:
 [Dispatcher API — Call Order and What Each Endpoint Does](https://claude.ai/code/artifact/0cf908bb-ceb1-4002-b9a2-27d50d6dc31f).
 
@@ -254,6 +258,7 @@ src/provider.ts             mock provider; shares no state with the dispatcher
 src/provider-client.ts      three-way outcome, idempotency key derivation
 postman/                    collection + environment
 docs/adr/                   ADRs 000-009
+docs/transcripts/           the two Claude Code sessions this was built in
 docs/brief.md               the original brief
 ```
 
