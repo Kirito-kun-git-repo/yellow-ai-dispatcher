@@ -1,0 +1,1009 @@
+{
+  "info": {
+    "_postman_id": "5940b452-3738-468a-9ce8-e248fd7f49c2",
+    "name": "Scheduled Notification Dispatcher",
+    "description": "Scheduled notification dispatcher \u2014 API, mock provider and a live dispatch run.\n\n## Before you start\n\n```\ndocker compose up -d          # Postgres on 5433\ndb/apply.sh --reset           # hand-written schema\nnpm run provider              # mock provider on 4010\nnpm run api                   # api on 3100\nnpm run worker                # worker 1\nnpm run worker                # worker 2 (second terminal)\n```\n\n## Folders\n\n| Folder | Needs | Shows |\n|---|---|---|\n| 0 \u00b7 Health | api + provider | the right processes are answering |\n| 1 \u00b7 Campaign lifecycle | api | A1, A2, A3 and the second-cancel no-op |\n| 2 \u00b7 Live dispatch | api + 2 workers + provider | messages actually going out, nothing stuck |\n| 3 \u00b7 Mock provider | provider | P1, P2, P3 and the key-before-dice ordering |\n| 4 \u00b7 Validation | api | every rejection path |\n\nFolders 0, 1, 3 and 4 run without workers. Folder 2 needs them.\n\nEvery request asserts the rule it demonstrates, so running the collection is a check, not a demo.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "apiUrl",
+      "value": "http://localhost:3100",
+      "description": "Port 3100, not 3000 \u2014 3000 collides with other local services."
+    },
+    {
+      "key": "providerUrl",
+      "value": "http://localhost:4010",
+      "description": "Mock provider."
+    },
+    {
+      "key": "campaignId",
+      "value": ""
+    },
+    {
+      "key": "liveCampaignId",
+      "value": ""
+    },
+    {
+      "key": "liveTotal",
+      "value": ""
+    },
+    {
+      "key": "liveTenant",
+      "value": ""
+    },
+    {
+      "key": "liveSendAt",
+      "value": ""
+    },
+    {
+      "key": "tenantId",
+      "value": ""
+    },
+    {
+      "key": "sendAt",
+      "value": ""
+    },
+    {
+      "key": "idemKey",
+      "value": ""
+    },
+    {
+      "key": "pollCount",
+      "value": "0"
+    },
+    {
+      "key": "errorRate",
+      "value": ""
+    },
+    {
+      "key": "timeoutRate",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "0 \u00b7 Health",
+      "description": "Confirms the three processes a full run needs are actually up, and that the thing answering is ours. Port 3000 is a common collision; the api process reports its own name so a stray service on the port cannot be mistaken for a pass.\n\nEither request, any order.",
+      "item": [
+        {
+          "name": "0.1 \u00b7 API is up",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/health",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Must report process=api. If this returns some other service's payload, something else owns the port."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"it is OUR api, not another service on this port\", () => {",
+                  "  pm.expect(pm.response.json().process).to.eql(\"api\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "0.2 \u00b7 Mock provider is up",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{providerUrl}}/health",
+              "host": [
+                "{{providerUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Also reports the configured failure rates, which the later folders depend on."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"process=provider\", () => pm.expect(b.process).to.eql(\"provider\"));",
+                  "console.log(\"provider rates -> error:\", b.error_rate, \"timeout:\", b.timeout_rate);",
+                  "pm.collectionVariables.set(\"errorRate\", String(b.error_rate));",
+                  "pm.collectionVariables.set(\"timeoutRate\", String(b.timeout_rate));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "1 \u00b7 Campaign lifecycle (A1, A2, A3)",
+      "description": "The three endpoints the brief specifies, run in order. Each request asserts the rule it demonstrates, so a green run here is evidence rather than decoration.\n\nRun this folder top to bottom \u2014 later requests use the campaign id the first one saves.\n\n**Run in order.** 1.1 saves the campaign id that 1.2 \u2013 1.5 use.",
+      "item": [
+        {
+          "name": "1.1 \u00b7 A1 \u00b7 POST /campaigns  (dedupes recipients)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns"
+              ]
+            },
+            "description": "Seeds a campaign. send_at is set far in the future by the pre-request script so the messages stay PENDING and can be cancelled \u2014 this folder is about the API, not dispatch.\n\nNote the recipients array: u2 appears three times. ADR-004 derives the provider idempotency key as campaign_id:user_id, so two rows for one recipient would share one key. The API drops the duplicates rather than letting the UNIQUE constraint 500.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"channel\": \"SMS\",\n  \"send_at\": \"{{sendAt}}\",\n  \"recipients\": [\n    \"u1\",\n    \"u2\",\n    \"u2\",\n    \"u3\",\n    \"u2\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Far enough out that no worker picks these up mid-folder.",
+                  "pm.collectionVariables.set(\"sendAt\", new Date(Date.now() + 3600e3).toISOString());",
+                  "pm.collectionVariables.set(\"tenantId\", \"postman-\" + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201 Created\", () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "pm.collectionVariables.set(\"campaignId\", b.id);",
+                  "pm.test(\"5 recipients in, 3 messages created\", () => pm.expect(b.messages_created).to.eql(3));",
+                  "pm.test(\"2 duplicate recipients dropped\", () => pm.expect(b.duplicates_dropped).to.eql(2));",
+                  "pm.test(\"starts SCHEDULED\", () => pm.expect(b.status).to.eql(\"SCHEDULED\"));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "1.2 \u00b7 A3 \u00b7 GET /campaigns/:id  (counts after seed)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns/{{campaignId}}",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "{{campaignId}}"
+              ]
+            },
+            "description": "R7 requires all five buckets, always present and always correct \u2014 not eventually correct. The counts come from a single GROUP BY, so they are read from one MVCC snapshot."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"all five buckets present\", () => {",
+                  "  pm.expect(b.counts).to.have.all.keys(\"pending\",\"in_progress\",\"sent\",\"failed\",\"cancelled\");",
+                  "});",
+                  "pm.test(\"3 pending, nothing else\", () => {",
+                  "  pm.expect(b.counts.pending).to.eql(3);",
+                  "  pm.expect(b.counts.in_progress + b.counts.sent + b.counts.failed + b.counts.cancelled).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "1.3 \u00b7 A2 \u00b7 POST /campaigns/:id/cancel  (first call)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns/{{campaignId}}/cancel",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "{{campaignId}}",
+                "cancel"
+              ]
+            },
+            "description": "Cancels the campaign and stops every PENDING message. IN_PROGRESS messages are deliberately left alone \u2014 R3 says a message already in flight must still report its true result."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"this call did the cancelling\", () => pm.expect(b.already_cancelled).to.eql(false));",
+                  "pm.test(\"3 pending messages stopped\", () => pm.expect(b.pending_messages_cancelled).to.eql(3));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "1.4 \u00b7 A3 \u00b7 GET /campaigns/:id  (counts after cancel)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns/{{campaignId}}",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "{{campaignId}}"
+              ]
+            },
+            "description": "The pending bucket must have emptied into cancelled, with no message lost in between."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "pm.test(\"campaign reads CANCELLED\", () => pm.expect(b.status).to.eql(\"CANCELLED\"));",
+                  "pm.test(\"pending drained to cancelled\", () => {",
+                  "  pm.expect(b.counts.pending).to.eql(0);",
+                  "  pm.expect(b.counts.cancelled).to.eql(3);",
+                  "});",
+                  "pm.test(\"no message went missing\", () => {",
+                  "  const c = b.counts;",
+                  "  pm.expect(c.pending+c.in_progress+c.sent+c.failed+c.cancelled).to.eql(3);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "1.5 \u00b7 A2 \u00b7 POST /campaigns/:id/cancel  (second call is a no-op)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns/{{campaignId}}/cancel",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "{{campaignId}}",
+                "cancel"
+              ]
+            },
+            "description": "R3: \"A second cancel call does nothing.\" The handler's UPDATE carries AND status <> 'CANCELLED', so it matches no row and cancelled_at is stamped exactly once. Zero messages are touched here."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200, not an error\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"reports it was already cancelled\", () => pm.expect(b.already_cancelled).to.eql(true));",
+                  "pm.test(\"touched 0 messages the second time\", () => pm.expect(b.pending_messages_cancelled).to.eql(0));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2 \u00b7 Live dispatch (needs workers running)",
+      "description": "Seeds a campaign due a few seconds out, then polls until every message reaches a terminal state. This is the folder that shows the workers, the rate limiter and the retry path doing real work.\n\nRequires: 1 api + 2 workers + the provider, all running. The poll request re-runs itself via setNextRequest until nothing is movable.\n\n**Run in order.** 2.1 seeds, 2.2 polls itself until settled, then jumps to 2.3.",
+      "item": [
+        {
+          "name": "2.1 \u00b7 Seed a campaign due in 3s",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns"
+              ]
+            },
+            "description": "60 recipients on a fresh tenant, so this campaign's rate-limit budget is its own.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{liveTenant}}\",\n  \"channel\": \"WHATSAPP\",\n  \"send_at\": \"{{liveSendAt}}\",\n  \"recipients\": [\n    \"{{dummy}}\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"liveTenant\", \"live-\" + Date.now());",
+                  "pm.collectionVariables.set(\"liveSendAt\", new Date(Date.now() + 3000).toISOString());",
+                  "const rs = []; for (let i = 1; i <= 60; i++) rs.push(\"user-\" + i);",
+                  "// Build the body here so the recipient list is not 60 lines of JSON in the request.",
+                  "pm.request.body.update({ mode: \"raw\", raw: JSON.stringify({",
+                  "  tenant_id: pm.collectionVariables.get(\"liveTenant\"),",
+                  "  channel: \"WHATSAPP\",",
+                  "  send_at: pm.collectionVariables.get(\"liveSendAt\"),",
+                  "  recipients: rs",
+                  "}) });"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"201\", () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "pm.collectionVariables.set(\"liveCampaignId\", b.id);",
+                  "pm.collectionVariables.set(\"liveTotal\", b.messages_created);",
+                  "pm.collectionVariables.set(\"pollCount\", \"0\");",
+                  "pm.test(\"60 messages seeded\", () => pm.expect(b.messages_created).to.eql(60));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "2.2 \u00b7 Poll until every message is terminal",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns/{{liveCampaignId}}",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "{{liveCampaignId}}"
+              ]
+            },
+            "description": "Re-runs itself until pending and in_progress are both zero, up to 60 tries. Each message ends SENT or FAILED \u2014 FAILED is a correct outcome under R4 when the provider refused all five attempts."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "const c = b.counts;",
+                  "const n = Number(pm.collectionVariables.get(\"pollCount\")) + 1;",
+                  "pm.collectionVariables.set(\"pollCount\", String(n));",
+                  "console.log(`poll ${n}:`, JSON.stringify(c));",
+                  "",
+                  "pm.test(\"counts never exceed what was seeded\", () => {",
+                  "  const total = c.pending + c.in_progress + c.sent + c.failed + c.cancelled;",
+                  "  pm.expect(total).to.eql(Number(pm.collectionVariables.get(\"liveTotal\")));",
+                  "});",
+                  "",
+                  "const settled = c.pending === 0 && c.in_progress === 0;",
+                  "if (!settled && n < 60) {",
+                  "  setTimeout(() => {}, 500);",
+                  "  postman.setNextRequest(\"2.2 \u00b7 Poll until every message is terminal\");",
+                  "} else {",
+                  "  pm.test(\"every message finished - nothing stuck\", () => {",
+                  "    pm.expect(c.pending, \"pending\").to.eql(0);",
+                  "    pm.expect(c.in_progress, \"in_progress\").to.eql(0);",
+                  "  });",
+                  "  pm.test(\"campaign reports COMPLETED\", () => pm.expect(b.status).to.eql(\"COMPLETED\"));",
+                  "  postman.setNextRequest(\"2.3 \u00b7 Provider \u00b7 GET /stats\");",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "2.3 \u00b7 Provider \u00b7 GET /stats",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{providerUrl}}/stats",
+              "host": [
+                "{{providerUrl}}"
+              ],
+              "path": [
+                "stats"
+              ]
+            },
+            "description": "P3. The oracle. Every accepted send is one entry here with its own timestamp \u2014 an array, not a map, so a duplicate could physically be recorded if the dispatcher ever caused one."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const s = pm.response.json();",
+                  "pm.test(\"no idempotency key was accepted twice (R1)\", () => {",
+                  "  const seen = new Map();",
+                  "  for (const a of s.accepted) seen.set(a.key, (seen.get(a.key) || 0) + 1);",
+                  "  const dupes = [...seen.entries()].filter(([, n]) => n > 1);",
+                  "  pm.expect(dupes, \"keys accepted more than once: \" + JSON.stringify(dupes)).to.eql([]);",
+                  "});",
+                  "pm.test(\"log length equals distinct keys\", () => {",
+                  "  pm.expect(s.total_accepted).to.eql(s.distinct_keys_accepted);",
+                  "});",
+                  "console.log(\"requests:\", s.total_requests, \"accepted:\", s.total_accepted,",
+                  "            \"-> retries caused by provider failures:\", s.total_requests - s.total_accepted);"
+                ]
+              }
+            }
+          ],
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3 \u00b7 Mock provider (P1, P2, P3)",
+      "description": "Demonstrates the provider contract on its own.\n\nThe first send can legitimately return 500 (20%) or hang (10%) \u2014 that is P2 working. Re-send it until you get a 200, then run the duplicate request. For a deterministic demo start the provider with PROVIDER_ERROR_RATE=0 PROVIDER_TIMEOUT_RATE=0.\n\n**Run in order.** 3.2 must return 200 before 3.3 can show the replay.",
+      "item": [
+        {
+          "name": "3.1 \u00b7 Reset the oracle",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{providerUrl}}/reset",
+              "host": [
+                "{{providerUrl}}"
+              ],
+              "path": [
+                "reset"
+              ]
+            },
+            "description": "Not in the brief. The harness needs a known-empty oracle per run."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", () => pm.response.to.have.status(200));",
+                  "pm.collectionVariables.set(\"idemKey\", \"demo-\" + Date.now() + \":user-7\");"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "3.2 \u00b7 P1 \u00b7 POST /send  (first time for this key)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idemKey}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "postman-demo"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{providerUrl}}/send",
+              "host": [
+                "{{providerUrl}}"
+              ],
+              "path": [
+                "send"
+              ]
+            },
+            "description": "The Idempotency-Key is campaign_id:user_id, derived identically by the worker and by the test harness \u2014 which is what lets the harness compute the expected key set from its own seed data instead of from the database it is grading.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"channel\": \"SMS\",\n  \"to\": \"user-7\",\n  \"body\": \"hello from postman\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const ok = pm.response.code === 200, err = pm.response.code === 500;",
+                  "pm.test(\"200 accepted, or 500 which is P2 working\", () => pm.expect(ok || err).to.be.true);",
+                  "if (ok) { pm.test(\"first send is not a duplicate\", () =>",
+                  "  pm.expect(pm.response.json().duplicate).to.eql(false)); }",
+                  "else { console.log(\"provider rolled a transient error - re-send to continue\"); }"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "3.3 \u00b7 P1 \u00b7 POST /send  (same key again \u2192 replayed, never re-sent)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idemKey}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "postman-demo"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{providerUrl}}/send",
+              "host": [
+                "{{providerUrl}}"
+              ],
+              "path": [
+                "send"
+              ]
+            },
+            "description": "The key is checked BEFORE the failure dice are rolled (ADR-006). If the order were reversed, a retry of an already-accepted key could come back 500, the dispatcher would never learn the message landed, and the row could reach FAILED while the recipient has the message \u2014 counts confidently wrong.\n\nRun this only after the previous request returned 200.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"channel\": \"SMS\",\n  \"to\": \"user-7\",\n  \"body\": \"hello from postman\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 even though the dice were never rolled\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"reported as a duplicate\", () => pm.expect(pm.response.json().duplicate).to.eql(true));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "3.4 \u00b7 P1 \u00b7 POST /send with no Idempotency-Key \u2192 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{providerUrl}}/send",
+              "host": [
+                "{{providerUrl}}"
+              ],
+              "path": [
+                "send"
+              ]
+            },
+            "description": "The key is the whole dedupe identity; a request without one cannot be made exactly-once.",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "3.5 \u00b7 P3 \u00b7 GET /stats",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{providerUrl}}/stats",
+              "host": [
+                "{{providerUrl}}"
+              ],
+              "path": [
+                "stats"
+              ]
+            },
+            "description": "Accepted sends with timestamps. Two /send calls above, one acceptance."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const s = pm.response.json();",
+                  "pm.test(\"exactly one acceptance for the demo key\", () => {",
+                  "  pm.expect(s.accepted.filter(a => a.key === pm.collectionVariables.get(\"idemKey\")).length).to.eql(1);",
+                  "});",
+                  "pm.test(\"but it was requested more than once\", () => {",
+                  "  pm.expect(s.request_counts[pm.collectionVariables.get(\"idemKey\")]).to.be.above(1);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4 \u00b7 Input validation and 404s",
+      "description": "Rejections are part of the contract. Every one returns a specific message rather than a generic 400, because a caller seeding 1,000 recipients needs to know which field was wrong.\n\nIndependent \u2014 any order, any subset.",
+      "item": [
+        {
+          "name": "4.1 \u00b7 channel must be SMS | WHATSAPP | EMAIL",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns"
+              ]
+            },
+            "description": "The channel set is closed by a Postgres enum; the API rejects before the database has to.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"t\",\n  \"channel\": \"PIGEON\",\n  \"send_at\": \"2026-12-01T10:00:00Z\",\n  \"recipients\": [\n    \"u1\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"explains itself\", () => pm.expect(pm.response.json().error).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "4.2 \u00b7 recipients must be non-empty",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns"
+              ]
+            },
+            "description": "A campaign with no recipients is almost certainly a client bug, not an empty broadcast.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"t\",\n  \"channel\": \"SMS\",\n  \"send_at\": \"2026-12-01T10:00:00Z\",\n  \"recipients\": []\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"explains itself\", () => pm.expect(pm.response.json().error).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "4.3 \u00b7 tenant_id must not be blank",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns"
+              ]
+            },
+            "description": "tenant_id keys the rate limiter. A blank one would pool unrelated tenants into one budget.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"   \",\n  \"channel\": \"SMS\",\n  \"send_at\": \"2026-12-01T10:00:00Z\",\n  \"recipients\": [\n    \"u1\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"explains itself\", () => pm.expect(pm.response.json().error).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "4.4 \u00b7 send_at must parse",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns"
+              ]
+            },
+            "description": "R2 is argued from this column. An unparseable value must never reach it.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"t\",\n  \"channel\": \"SMS\",\n  \"send_at\": \"next tuesday-ish\",\n  \"recipients\": [\n    \"u1\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"explains itself\", () => pm.expect(pm.response.json().error).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "4.5 \u00b7 GET unknown campaign \u2192 404",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns/999999",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "999999"
+              ]
+            },
+            "description": "Distinct from a campaign that exists with zero messages, which returns 200 and zeros."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"explains itself\", () => pm.expect(pm.response.json().error).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "4.6 \u00b7 CANCEL unknown campaign \u2192 404",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns/999999/cancel",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "999999",
+                "cancel"
+              ]
+            },
+            "description": "Cancelling something that does not exist is an error, not a silent success."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"explains itself\", () => pm.expect(pm.response.json().error).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "4.7 \u00b7 non-integer id \u2192 400",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/campaigns/not-a-number",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "campaigns",
+                "not-a-number"
+              ]
+            },
+            "description": "Caught before it reaches the query."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"explains itself\", () => pm.expect(pm.response.json().error).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ],
+          "response": []
+        }
+      ]
+    }
+  ]
+}

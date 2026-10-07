@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+*.log
+.tmp/
+.run/
+
+# Local scratch from a separate design session. Not part of the deliverable.
+.panel/

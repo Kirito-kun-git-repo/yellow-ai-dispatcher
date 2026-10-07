@@ -1,0 +1,27 @@
+{
+  "name": "scheduled-notification-dispatcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "api": "node src/api.ts",
+    "worker": "node src/worker.ts",
+    "provider": "node src/provider.ts",
+    "schema": "db/apply.sh --reset",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "newman": "^6.2.2",
+    "typescript": "^5.7.2"
+  }
+}

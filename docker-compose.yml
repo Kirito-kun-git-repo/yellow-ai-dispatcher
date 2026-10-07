@@ -1,0 +1,30 @@
+# Postgres only. The API, the workers and the mock provider all run as plain
+# host processes so that `kill -9` on a worker (T3) is a one-line operation and
+# not a container lifecycle question.
+services:
+  postgres:
+    image: postgres:16
+    container_name: dispatcher-db
+    environment:
+      POSTGRES_USER: dispatcher
+      POSTGRES_PASSWORD: dispatcher
+      POSTGRES_DB: dispatcher
+    ports:
+      # Host side defaults to 5433 to stay out of the way of a local Postgres.
+      - "${DB_PORT:-5433}:5432"
+    volumes:
+      - dispatcher-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dispatcher -d dispatcher"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    command:
+      # The claim query is the hot path and it is worth being able to read what
+      # the planner did with it without restarting anything.
+      - postgres
+      - -c
+      - log_min_duration_statement=500
+
+volumes:
+  dispatcher-pgdata:
